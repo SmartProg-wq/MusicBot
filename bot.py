@@ -7,27 +7,23 @@ import time
 import os
 import socket
 from datetime import datetime, timedelta
+from contextlib import asynccontextmanager
 
-from telethon import TelegramClient, events
+from telethon import TelegramClient
+from telethon.sessions import StringSession
 from telethon.tl.functions.messages import EditInlineBotMessageRequest
-from telethon.tl.custom.button import Button
 from telethon.tl.types import (
-    UpdateBotInlineSend,
     InputMediaUploadedDocument,
     DocumentAttributeAudio,
     DocumentAttributeFilename,
-    InputWebDocument,
-    DocumentAttributeImageSize,
     KeyboardButtonUrl,
     KeyboardButtonRow,
     ReplyInlineMarkup,
 )
-from telethon.extensions import html
-from telethon.sessions import StringSession
+from telethon.extensions import html as tl_html
 
-from fastapi import FastAPI
-from fastapi.responses import HTMLResponse
-from contextlib import asynccontextmanager
+from fastapi import FastAPI, Request, Response
+from fastapi.responses import HTMLResponse, JSONResponse
 import uvicorn
 
 logging.basicConfig(
@@ -45,9 +41,8 @@ SEARCH_API = "https://saavn.sumit.co/api/search/songs"
 MAX_TG_FILE_SIZE = 50 * 1024 * 1024
 CHANNEL_URL = "https://t.me/thesmartdev"
 TMP_DIR = "/tmp"
-
-user_download_timestamps: dict[int, datetime] = {}
-song_cache: dict[str, dict] = {}
+TG_API_BASE = f"https://api.telegram.org/bot{BOT_TOKEN}"
+BOT_USERNAME = "thesmartdevbot"
 
 BROWSER_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -55,8 +50,8 @@ BROWSER_UA = (
     "Chrome/124.0.0.0 Safari/537.36"
 )
 
-_client: TelegramClient | None = None
-_bot_username: str = "unknown"
+user_download_timestamps: dict[int, datetime] = {}
+song_cache: dict[str, dict] = {}
 
 
 def get_local_ip() -> str:
@@ -77,6 +72,23 @@ def is_rate_limited(user_id: int) -> bool:
 
 def update_rate_limit(user_id: int) -> None:
     user_download_timestamps[user_id] = datetime.now()
+
+
+async def tg_api(session: aiohttp.ClientSession, method: str, payload: dict) -> dict:
+    url = f"{TG_API_BASE}/{method}"
+    async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+        data = await resp.json()
+        if not data.get("ok"):
+            logger.warning(f"[TG_API] {method} failed: {data}")
+        return data
+
+
+async def edit_inline_message_text(session: aiohttp.ClientSession, inline_message_id: str, text: str) -> dict:
+    return await tg_api(session, "editMessageText", {
+        "inline_message_id": inline_message_id,
+        "text": text,
+        "parse_mode": "HTML",
+    })
 
 
 async def search_songs(query: str) -> list:
@@ -138,49 +150,41 @@ def cleanup_tmp(path: str) -> None:
         logger.warning(f"[CLEANUP] Could not remove {path}: {e}")
 
 
-async def safe_edit_text(client, msg_id, text: str) -> None:
-    logger.info(f"[EDIT] Updating inline message text: {text[:80]}")
-    try:
-        await client(EditInlineBotMessageRequest(
-            id=msg_id,
-            message=text,
-            media=None,
-        ))
-    except Exception as e:
-        logger.warning(f"[EDIT] Could not edit inline message: {e}")
-
-
-async def progress_bar(current, total, start_time, last_update):
+async def progress_bar(current: int, total: int, start_time: float, last_update: list) -> str | None:
     elapsed_time = time.time() - start_time
     if elapsed_time == 0:
         elapsed_time = 0.1
-
     percentage = (current / total) * 100
-    progress = f"{'▓' * int(percentage // 5)}{'░' * (20 - int(percentage // 5))}"
+    filled = int(percentage // 5)
+    progress = f"{'▓' * filled}{'░' * (20 - filled)}"
     speed = current / elapsed_time / 1024 / 1024
-    uploaded = current / 1024 / 1024
-    total_size = total / 1024 / 1024
-
+    uploaded_mb = current / 1024 / 1024
+    total_mb = total / 1024 / 1024
     if time.time() - last_update[0] < 1:
         return None
-
     last_update[0] = time.time()
-
-    text = (
+    return (
         f"🎵 <b>Smart Upload Progress Bar ✅</b>\n"
         f"<b>━━━━━━━━━━━━━━━━━━━━━</b>\n"
         f"{progress}\n"
         f"<b>Percentage:</b> {percentage:.2f}%\n"
         f"<b>Speed:</b> {speed:.2f} MB/s\n"
-        f"<b>Status:</b> {uploaded:.2f} MB of {total_size:.2f} MB\n"
+        f"<b>Status:</b> {uploaded_mb:.2f} MB of {total_mb:.2f} MB\n"
         f"<b>━━━━━━━━━━━━━━━━━━━━━</b>\n"
         f"<b>Smooth Transfer → Activated ✅</b>"
     )
 
-    return text
 
+async def process_chosen_inline(inline_message_id: str, result_id: str, user_id: int) -> None:
+    logger.info(f"[PROC] inline_message_id={inline_message_id} result_id={result_id} user={user_id}")
 
-async def process_inline_song(client, msg_id, song_data: dict, user_id: int) -> None:
+    song_data = song_cache.get(result_id)
+    if not song_data:
+        logger.error(f"[PROC] Song data not found for result_id={result_id}")
+        async with aiohttp.ClientSession() as session:
+            await edit_inline_message_text(session, inline_message_id, "❌ Session expired. Search again.")
+        return
+
     song_name = song_data.get("name", "Unknown")
     artists = song_data.get("artists", {})
     primary_artists = artists.get("primary", [])
@@ -188,290 +192,293 @@ async def process_inline_song(client, msg_id, song_data: dict, user_id: int) -> 
     album = song_data.get("album", {})
     album_name = album.get("name", "Unknown Album")
     duration = song_data.get("duration", 0)
-    image_list = song_data.get("image", [])
     download_urls = song_data.get("downloadUrl", [])
     play_count = song_data.get("playCount", 0)
     song_url = song_data.get("url", "")
 
-    logger.info(f"[INLINE_PROC] User {user_id} | Song: {song_name}")
-
     tmp_path = None
+
+    async with aiohttp.ClientSession() as session:
+        try:
+            await edit_inline_message_text(session, inline_message_id, "🔍 Searching The Audio...")
+
+            if is_rate_limited(user_id):
+                logger.info(f"[PROC] User {user_id} rate limited")
+                await edit_inline_message_text(
+                    session, inline_message_id,
+                    f"⏳ Rate limited. Wait {RATE_LIMIT_WINDOW_MINUTES} minute(s)."
+                )
+                return
+
+            if not download_urls:
+                await edit_inline_message_text(session, inline_message_id, f"❌ No download URLs.\n{song_name}")
+                return
+
+            best_url = None
+            best_quality = ""
+            for url_info in download_urls:
+                quality = url_info.get("quality", "")
+                url_dl = url_info.get("url", "")
+                if url_dl:
+                    if quality in ("320kbps", "160kbps"):
+                        best_url = url_dl
+                        best_quality = quality
+                        break
+                    elif quality == "96kbps" and not best_url:
+                        best_url = url_dl
+                        best_quality = quality
+
+            if not best_url:
+                await edit_inline_message_text(session, inline_message_id, f"❌ No suitable URL.\n{song_name}")
+                return
+
+            await edit_inline_message_text(session, inline_message_id, "Found ☑️ Downloading...")
+            logger.info(f"[PROC] Downloading {best_quality} for {song_name}")
+
+        except Exception as e:
+            logger.exception(f"[PROC] Pre-download phase error: {e}")
+            return
+
     try:
-        await safe_edit_text(client, msg_id, "🔍 Searching The Audio...")
-
-        if is_rate_limited(user_id):
-            logger.info(f"[INLINE_PROC] User {user_id} is rate limited")
-            await safe_edit_text(
-                client, msg_id,
-                f"Rate limited. Wait {RATE_LIMIT_WINDOW_MINUTES} minute(s)."
-            )
-            return
-
-        if not download_urls:
-            await safe_edit_text(client, msg_id, f"No download URLs found.\n{song_name}")
-            return
-
-        best_url = None
-        best_quality = ""
-        for url_info in download_urls:
-            quality = url_info.get("quality", "")
-            url_dl = url_info.get("url", "")
-            if url_dl:
-                if quality in ("320kbps", "160kbps"):
-                    best_url = url_dl
-                    best_quality = quality
-                    break
-                elif quality == "96kbps" and not best_url:
-                    best_url = url_dl
-                    best_quality = quality
-
-        if not best_url:
-            await safe_edit_text(client, msg_id, f"No suitable download URL found.\n{song_name}")
-            return
-
-        await safe_edit_text(client, msg_id, "Found ☑️ Downloading...")
-
-        logger.info(f"[INLINE_PROC] Downloading: {best_quality}")
-
         tmp_path = await download_song_to_tmp(best_url, best_quality)
         size_bytes = os.path.getsize(tmp_path)
         size_mb = size_bytes / 1024 / 1024
-        logger.info(f"[INLINE_PROC] Downloaded {size_mb:.1f} MB -> {tmp_path}")
+        logger.info(f"[PROC] Downloaded {size_mb:.1f} MB")
 
         if size_bytes > MAX_TG_FILE_SIZE:
-            await safe_edit_text(
-                client, msg_id,
-                f"File too large ({size_mb:.1f} MB). Telegram limit is 50 MB.\n{song_name}"
-            )
+            async with aiohttp.ClientSession() as session:
+                await edit_inline_message_text(
+                    session, inline_message_id,
+                    f"❌ File too large ({size_mb:.1f} MB). Telegram limit is 50 MB.\n{song_name}"
+                )
+            cleanup_tmp(tmp_path)
             return
 
-        start_time = time.time()
-        last_update = [time.time()]
+        client = TelegramClient(StringSession(), API_ID, API_HASH)
+        await client.start(bot_token=BOT_TOKEN)
+        logger.info("[PROC] Telethon client started for MTProto upload")
 
-        async def progress_callback(current, total):
-            progress_text = await progress_bar(current, total, start_time, last_update)
-            if progress_text:
-                try:
-                    progress_text_parsed, progress_entities = html.parse(progress_text)
-                    await client(EditInlineBotMessageRequest(
-                        id=msg_id,
-                        message=progress_text_parsed,
-                        media=None,
-                        entities=progress_entities
-                    ))
-                except Exception as e:
-                    logger.warning(f"[PROGRESS] Could not update: {e}")
+        try:
+            with open(tmp_path, "rb") as f:
+                song_bytes = f.read()
 
-        with open(tmp_path, "rb") as f:
-            song_bytes = f.read()
+            cleanup_tmp(tmp_path)
+            tmp_path = None
 
-        buf = io.BytesIO(song_bytes)
-        buf.name = "song.mp3"
+            buf = io.BytesIO(song_bytes)
+            buf.name = "song.mp3"
 
-        uploaded = await client.upload_file(
-            buf,
-            file_name="song.mp3",
-            file_size=size_bytes,
-            progress_callback=progress_callback
-        )
-        logger.info(f"[INLINE_PROC] Upload complete")
+            start_time = time.time()
+            last_update = [time.time()]
 
-        cleanup_tmp(tmp_path)
-        tmp_path = None
+            async def progress_callback(current, total):
+                bar_text = await progress_bar(current, total, start_time, last_update)
+                if bar_text:
+                    try:
+                        async with aiohttp.ClientSession() as s:
+                            await edit_inline_message_text(s, inline_message_id, bar_text)
+                    except Exception as pe:
+                        logger.warning(f"[PROGRESS] Update failed: {pe}")
 
-        escaped_title = song_name
-        user_info = f"<a href='tg://user?id={user_id}'>User {user_id}</a>"
+            uploaded = await client.upload_file(
+                buf,
+                file_name="song.mp3",
+                file_size=size_bytes,
+                progress_callback=progress_callback,
+            )
+            logger.info("[PROC] File uploaded via MTProto")
 
-        caption_html = (
-            f"🎵 <b>Title:</b> <code>{escaped_title}</code>\n"
-            f"<b>━━━━━━━━━━━━━━━━━━━━━</b>\n"
-            f"👁️‍🗨️ <b>Views:</b> <b>{play_count}</b>\n"
-            f"<b>🔗 Url:</b> <a href=\"{song_url}\">Listen On Saavn</a>\n"
-            f"⏱️ <b>Duration:</b> <b>{duration}s</b>\n"
-            f"🎤 <b>Artist:</b> <b>{artist_names}</b>\n"
-            f"💿 <b>Album:</b> <b>{album_name}</b>\n"
-            f"🎧 <b>Quality:</b> <b>{best_quality}</b>\n"
-            f"<b>━━━━━━━━━━━━━━━━━━━━━</b>\n"
-            f"<b>Downloaded By:</b> {user_info}"
-        )
+            user_info = f"<a href='tg://user?id={user_id}'>User {user_id}</a>"
+            caption_html = (
+                f"🎵 <b>Title:</b> <code>{song_name}</code>\n"
+                f"<b>━━━━━━━━━━━━━━━━━━━━━</b>\n"
+                f"👁️‍🗨️ <b>Views:</b> <b>{play_count}</b>\n"
+                f"<b>🔗 Url:</b> <a href=\"{song_url}\">Listen On Saavn</a>\n"
+                f"⏱️ <b>Duration:</b> <b>{duration}s</b>\n"
+                f"🎤 <b>Artist:</b> <b>{artist_names}</b>\n"
+                f"💿 <b>Album:</b> <b>{album_name}</b>\n"
+                f"🎧 <b>Quality:</b> <b>{best_quality}</b>\n"
+                f"<b>━━━━━━━━━━━━━━━━━━━━━</b>\n"
+                f"<b>Downloaded By:</b> {user_info}"
+            )
 
-        caption_text, caption_entities = html.parse(caption_html)
+            caption_text, caption_entities = tl_html.parse(caption_html)
 
-        media = InputMediaUploadedDocument(
-            file=uploaded,
-            mime_type="audio/mpeg",
-            attributes=[
-                DocumentAttributeAudio(duration=duration, title=escaped_title, performer=artist_names),
-                DocumentAttributeFilename(file_name="song.mp3"),
-            ],
-        )
+            media = InputMediaUploadedDocument(
+                file=uploaded,
+                mime_type="audio/mpeg",
+                attributes=[
+                    DocumentAttributeAudio(duration=duration, title=song_name, performer=artist_names),
+                    DocumentAttributeFilename(file_name="song.mp3"),
+                ],
+            )
 
-        button = KeyboardButtonUrl("📢 Join Channel", CHANNEL_URL)
-        row = KeyboardButtonRow(buttons=[button])
-        reply_markup = ReplyInlineMarkup(rows=[row])
+            button = KeyboardButtonUrl("📢 Join Channel", CHANNEL_URL)
+            row = KeyboardButtonRow(buttons=[button])
+            reply_markup = ReplyInlineMarkup(rows=[row])
 
-        await client(EditInlineBotMessageRequest(
-            id=msg_id,
-            message=caption_text,
-            media=media,
-            reply_markup=reply_markup,
-            entities=caption_entities
-        ))
+            await client(EditInlineBotMessageRequest(
+                id=inline_message_id,
+                message=caption_text,
+                media=media,
+                reply_markup=reply_markup,
+                entities=caption_entities,
+            ))
 
-        update_rate_limit(user_id)
-        logger.info(f"[INLINE_PROC] Done. Inline message replaced with audio for user {user_id}")
+            update_rate_limit(user_id)
+            logger.info(f"[PROC] Done — audio sent for user {user_id}")
+
+        finally:
+            await client.disconnect()
+            logger.info("[PROC] Telethon client disconnected")
 
     except Exception as e:
-        logger.exception(f"[INLINE_PROC] Fatal error: {e}")
+        logger.exception(f"[PROC] Fatal error: {e}")
         if tmp_path:
             cleanup_tmp(tmp_path)
         try:
-            await safe_edit_text(client, msg_id, f"Error: {str(e)[:200]}\n{song_name}")
-        except Exception as e2:
-            logger.warning(f"[INLINE_PROC] Could not send error edit: {e2}")
-
-
-async def start_bot() -> TelegramClient:
-    global _client, _bot_username
-    logger.info("[BOT] Creating Telegram client with in-memory StringSession...")
-    client = TelegramClient(StringSession(), API_ID, API_HASH)
-
-    logger.info("[BOT] Connecting with bot token...")
-    await client.start(bot_token=BOT_TOKEN)
-    logger.info("[BOT] Connected successfully!")
-
-    me = await client.get_me()
-    _bot_username = me.username or "unknown"
-    logger.info(f"[BOT] Bot username: @{_bot_username}, id: {me.id}")
-
-    @client.on(events.NewMessage(pattern="/start"))
-    async def start_handler(event):
-        user = await event.get_sender()
-        name = getattr(user, "first_name", "there")
-        logger.info(f"[START] User {user.id} ({name}) used /start")
-        await event.reply(
-            f"Hi {name}!\n\nUse inline mode: @{_bot_username} song name"
-        )
-        raise events.StopPropagation
-
-    @client.on(events.InlineQuery)
-    async def inline_handler(event):
-        query = event.text.strip()
-        user_id = event.query.user_id
-        logger.info(f"[INLINE] User {user_id} query: '{query}'")
-
-        if not query:
-            await event.answer([])
-            return
-
-        if is_rate_limited(user_id):
-            logger.info(f"[INLINE] User {user_id} rate limited")
-            await event.answer([])
-            return
-
-        builder = event.builder
-
-        try:
-            items = await search_songs(query)
-        except Exception as e:
-            logger.error(f"[INLINE] Search error: {e}")
-            await event.answer([])
-            return
-
-        results = []
-        for i, item in enumerate(items[:10]):
-            title = item.get("name", "Unknown")
-            artists = item.get("artists", {})
-            primary_artists = artists.get("primary", [])
-            artist_names = ", ".join([a.get("name", "") for a in primary_artists])
-            album = item.get("album", {})
-            album_name = album.get("name", "Unknown")
-            duration = item.get("duration", 0)
-            image_list = item.get("image", [])
-            thumb_url = image_list[0].get("url", "") if image_list else ""
-            song_id = item.get("id", "")
-
-            if not song_id:
-                continue
-
-            logger.info(f"[INLINE] Building result {i + 1}: {title[:40]}")
-
-            cache_key = str(uuid.uuid4())
-            song_cache[cache_key] = item
-
-            try:
-                result = await builder.article(
-                    id=cache_key,
-                    title=title,
-                    description=f"{artist_names} | {album_name}",
-                    text=f"Preparing...\n{title}",
-                    thumb=InputWebDocument(
-                        url=thumb_url, size=0, mime_type="image/jpeg",
-                        attributes=[DocumentAttributeImageSize(w=226, h=226)],
-                    ) if thumb_url else None,
-                    link_preview=False,
-                    buttons=Button.inline("Download", data=cache_key.encode()[:64]),
+            async with aiohttp.ClientSession() as session:
+                await edit_inline_message_text(
+                    session, inline_message_id,
+                    f"❌ Error: {str(e)[:200]}\n{song_name}"
                 )
-                results.append(result)
-            except Exception as e:
-                logger.warning(f"[INLINE] Skipping result {i}: {e}")
+        except Exception as e2:
+            logger.warning(f"[PROC] Could not send error edit: {e2}")
 
-        logger.info(f"[INLINE] Answering with {len(results)} results")
-        await event.answer(results, cache_time=30, private=True)
 
-    @client.on(events.Raw(UpdateBotInlineSend))
-    async def chosen_inline_handler(update):
-        user_id = update.user_id
-        result_id = update.id
-        msg_id = update.msg_id
-        logger.info(f"[CHOSEN] User {user_id} | result_id='{result_id}' | msg_id={msg_id}")
+async def handle_inline_query(update: dict) -> None:
+    iq = update["inline_query"]
+    inline_query_id = iq["id"]
+    query = iq.get("query", "").strip()
+    user_id = iq["from"]["id"]
 
-        if msg_id is None:
-            logger.error("[CHOSEN] msg_id is None! Enable inline feedback in @BotFather")
-            return
+    logger.info(f"[INLINE] User {user_id} query: '{query}'")
 
-        song_data = song_cache.get(result_id)
-        if not song_data:
-            logger.error(f"[CHOSEN] Song data not found for: {result_id}")
-            return
+    if not query:
+        async with aiohttp.ClientSession() as session:
+            await tg_api(session, "answerInlineQuery", {
+                "inline_query_id": inline_query_id,
+                "results": [],
+                "cache_time": 0,
+            })
+        return
 
-        logger.info(f"[CHOSEN] Launching download for: {song_data.get('name')}")
-        asyncio.create_task(process_inline_song(client, msg_id, song_data, user_id))
+    if is_rate_limited(user_id):
+        logger.info(f"[INLINE] User {user_id} rate limited")
+        async with aiohttp.ClientSession() as session:
+            await tg_api(session, "answerInlineQuery", {
+                "inline_query_id": inline_query_id,
+                "results": [],
+                "cache_time": 0,
+            })
+        return
 
-    logger.info("[BOT] All handlers registered.")
-    _client = client
-    return client
+    try:
+        items = await search_songs(query)
+    except Exception as e:
+        logger.error(f"[INLINE] Search error: {e}")
+        async with aiohttp.ClientSession() as session:
+            await tg_api(session, "answerInlineQuery", {
+                "inline_query_id": inline_query_id,
+                "results": [],
+                "cache_time": 0,
+            })
+        return
+
+    results = []
+    for i, item in enumerate(items[:10]):
+        title = item.get("name", "Unknown")
+        artists = item.get("artists", {})
+        primary_artists = artists.get("primary", [])
+        artist_names = ", ".join([a.get("name", "") for a in primary_artists])
+        album = item.get("album", {})
+        album_name = album.get("name", "Unknown")
+        duration = item.get("duration", 0)
+        image_list = item.get("image", [])
+        thumb_url = image_list[0].get("url", "") if image_list else ""
+        song_id = item.get("id", "")
+
+        if not song_id:
+            continue
+
+        cache_key = str(uuid.uuid4())
+        song_cache[cache_key] = item
+
+        logger.info(f"[INLINE] Result {i + 1}: {title[:40]} -> cache_key={cache_key}")
+
+        result: dict = {
+            "type": "article",
+            "id": cache_key,
+            "title": title,
+            "description": f"{artist_names} | {album_name} | {duration}s",
+            "input_message_content": {
+                "message_text": f"⏳ Preparing: {title}",
+            },
+        }
+
+        if thumb_url:
+            result["thumbnail_url"] = thumb_url
+            result["thumbnail_width"] = 226
+            result["thumbnail_height"] = 226
+
+        results.append(result)
+
+    logger.info(f"[INLINE] Answering with {len(results)} results")
+    async with aiohttp.ClientSession() as session:
+        await tg_api(session, "answerInlineQuery", {
+            "inline_query_id": inline_query_id,
+            "results": results,
+            "cache_time": 30,
+            "is_personal": True,
+        })
+
+
+async def handle_chosen_inline_result(update: dict) -> None:
+    cir = update["chosen_inline_result"]
+    result_id = cir["result_id"]
+    user_id = cir["from"]["id"]
+    inline_message_id = cir.get("inline_message_id")
+
+    logger.info(f"[CHOSEN] user={user_id} result_id={result_id} inline_message_id={inline_message_id}")
+
+    if not inline_message_id:
+        logger.error("[CHOSEN] inline_message_id is None — enable inline feedback in @BotFather (100%)")
+        return
+
+    asyncio.create_task(process_chosen_inline(inline_message_id, result_id, user_id))
+
+
+async def handle_message(update: dict) -> None:
+    message = update.get("message", {})
+    chat_id = message.get("chat", {}).get("id")
+    text = message.get("text", "")
+    first_name = message.get("from", {}).get("first_name", "there")
+    user_id = message.get("from", {}).get("id")
+
+    logger.info(f"[MSG] user={user_id} text='{text}'")
+
+    if text.startswith("/start"):
+        reply = (
+            f"Hi {first_name}!\n\n"
+            f"Use inline mode: @{BOT_USERNAME} song name\n\n"
+            f"Example: @{BOT_USERNAME} Kesariya"
+        )
+        async with aiohttp.ClientSession() as session:
+            await tg_api(session, "sendMessage", {
+                "chat_id": chat_id,
+                "text": reply,
+            })
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     local_ip = get_local_ip()
     port = int(os.environ.get("PORT", 8000))
-    logger.info(f"[API] FastAPI starting on 0.0.0.0:{port}")
+    logger.info(f"[API] FastAPI starting — bound to 0.0.0.0:{port}")
     logger.info(f"[API] Actual local IP: {local_ip}:{port}")
-    logger.info(f"[API] Loopback access: 127.0.0.1:{port}")
-
-    bot_task = asyncio.create_task(_run_bot())
+    logger.info(f"[API] Loopback: 127.0.0.1:{port}")
     yield
-    bot_task.cancel()
-    try:
-        await bot_task
-    except asyncio.CancelledError:
-        logger.info("[BOT] Bot task cancelled cleanly.")
-    if _client and _client.is_connected():
-        await _client.disconnect()
-        logger.info("[BOT] Disconnected Telegram client.")
-
-
-async def _run_bot():
-    try:
-        client = await start_bot()
-        logger.info("[BOT] Running until disconnected...")
-        await client.run_until_disconnected()
-    except asyncio.CancelledError:
-        raise
-    except Exception as e:
-        logger.exception(f"[BOT] Fatal error in bot task: {e}")
+    logger.info("[API] Shutting down.")
 
 
 app = FastAPI(lifespan=lifespan)
@@ -479,8 +486,6 @@ app = FastAPI(lifespan=lifespan)
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
-    global _bot_username
-    username = _bot_username or "loading..."
     html_content = (
         "<!DOCTYPE html>"
         "<html lang='en'>"
@@ -492,94 +497,55 @@ async def index():
         "<link href='https://fonts.googleapis.com/css2?family=Syne:wght@400;700;800&family=DM+Mono:wght@400;500&display=swap' rel='stylesheet'/>"
         "<style>"
         "*{margin:0;padding:0;box-sizing:border-box}"
-        "body{"
-        "min-height:100vh;display:flex;align-items:center;justify-content:center;"
-        "background:#0a0a0f;"
-        "font-family:'Syne',sans-serif;"
-        "overflow:hidden;"
-        "}"
-        ".bg-orb{"
-        "position:fixed;border-radius:50%;filter:blur(80px);pointer-events:none;z-index:0;"
-        "}"
-        ".orb1{width:500px;height:500px;background:radial-gradient(circle,#7c3aed33,transparent);top:-100px;left:-100px;animation:drift1 8s ease-in-out infinite alternate;}"
-        ".orb2{width:400px;height:400px;background:radial-gradient(circle,#06b6d433,transparent);bottom:-80px;right:-80px;animation:drift2 10s ease-in-out infinite alternate;}"
-        ".orb3{width:300px;height:300px;background:radial-gradient(circle,#f43f5e22,transparent);top:40%;left:40%;animation:drift1 12s ease-in-out infinite alternate-reverse;}"
+        "body{min-height:100vh;display:flex;align-items:center;justify-content:center;"
+        "background:#0a0a0f;font-family:'Syne',sans-serif;overflow:hidden;}"
+        ".bg-orb{position:fixed;border-radius:50%;filter:blur(80px);pointer-events:none;z-index:0;}"
+        ".orb1{width:500px;height:500px;background:radial-gradient(circle,#7c3aed33,transparent);"
+        "top:-100px;left:-100px;animation:drift1 8s ease-in-out infinite alternate;}"
+        ".orb2{width:400px;height:400px;background:radial-gradient(circle,#06b6d433,transparent);"
+        "bottom:-80px;right:-80px;animation:drift2 10s ease-in-out infinite alternate;}"
+        ".orb3{width:300px;height:300px;background:radial-gradient(circle,#f43f5e22,transparent);"
+        "top:40%;left:40%;animation:drift1 12s ease-in-out infinite alternate-reverse;}"
         "@keyframes drift1{0%{transform:translate(0,0)}100%{transform:translate(40px,30px)}}"
         "@keyframes drift2{0%{transform:translate(0,0)}100%{transform:translate(-30px,-40px)}}"
-        ".card{"
-        "position:relative;z-index:1;"
-        "background:rgba(255,255,255,0.04);"
-        "border:1px solid rgba(255,255,255,0.08);"
-        "border-radius:24px;"
-        "padding:56px 48px;"
-        "max-width:480px;width:90%;"
-        "backdrop-filter:blur(20px);"
-        "-webkit-backdrop-filter:blur(20px);"
+        ".card{position:relative;z-index:1;background:rgba(255,255,255,0.04);"
+        "border:1px solid rgba(255,255,255,0.08);border-radius:24px;padding:56px 48px;"
+        "max-width:480px;width:90%;backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);"
         "box-shadow:0 0 0 1px rgba(124,58,237,0.15),0 32px 64px rgba(0,0,0,0.6);"
-        "text-align:center;"
-        "animation:fadeUp 0.7s cubic-bezier(.16,1,.3,1) both;"
-        "}"
+        "text-align:center;animation:fadeUp 0.7s cubic-bezier(.16,1,.3,1) both;}"
         "@keyframes fadeUp{from{opacity:0;transform:translateY(24px)}to{opacity:1;transform:translateY(0)}}"
-        ".pulse-ring{"
-        "width:80px;height:80px;border-radius:50%;"
+        ".pulse-ring{width:80px;height:80px;border-radius:50%;"
         "background:linear-gradient(135deg,#7c3aed,#06b6d4);"
-        "display:flex;align-items:center;justify-content:center;"
-        "margin:0 auto 32px;"
-        "font-size:36px;"
-        "position:relative;"
-        "animation:iconPop 0.5s 0.3s cubic-bezier(.34,1.56,.64,1) both;"
-        "}"
+        "display:flex;align-items:center;justify-content:center;margin:0 auto 32px;font-size:36px;"
+        "position:relative;animation:iconPop 0.5s 0.3s cubic-bezier(.34,1.56,.64,1) both;}"
         "@keyframes iconPop{from{opacity:0;transform:scale(0.4)}to{opacity:1;transform:scale(1)}}"
-        ".pulse-ring::before{"
-        "content:'';"
-        "position:absolute;inset:-8px;border-radius:50%;"
-        "border:2px solid rgba(124,58,237,0.4);"
-        "animation:ringPulse 2s ease-out infinite;"
-        "}"
-        ".pulse-ring::after{"
-        "content:'';"
-        "position:absolute;inset:-16px;border-radius:50%;"
-        "border:2px solid rgba(124,58,237,0.2);"
-        "animation:ringPulse 2s 0.4s ease-out infinite;"
-        "}"
+        ".pulse-ring::before{content:'';position:absolute;inset:-8px;border-radius:50%;"
+        "border:2px solid rgba(124,58,237,0.4);animation:ringPulse 2s ease-out infinite;}"
+        ".pulse-ring::after{content:'';position:absolute;inset:-16px;border-radius:50%;"
+        "border:2px solid rgba(124,58,237,0.2);animation:ringPulse 2s 0.4s ease-out infinite;}"
         "@keyframes ringPulse{0%{transform:scale(1);opacity:1}100%{transform:scale(1.4);opacity:0}}"
-        ".status-badge{"
-        "display:inline-flex;align-items:center;gap:8px;"
-        "background:rgba(16,185,129,0.12);"
-        "border:1px solid rgba(16,185,129,0.3);"
-        "color:#34d399;"
-        "font-family:'DM Mono',monospace;"
-        "font-size:12px;font-weight:500;"
-        "padding:6px 14px;border-radius:100px;"
-        "margin-bottom:24px;"
-        "letter-spacing:0.05em;"
-        "}"
-        ".dot{width:7px;height:7px;border-radius:50%;background:#34d399;animation:blink 1.4s ease-in-out infinite;}"
+        ".status-badge{display:inline-flex;align-items:center;gap:8px;"
+        "background:rgba(16,185,129,0.12);border:1px solid rgba(16,185,129,0.3);"
+        "color:#34d399;font-family:'DM Mono',monospace;font-size:12px;font-weight:500;"
+        "padding:6px 14px;border-radius:100px;margin-bottom:24px;letter-spacing:0.05em;}"
+        ".dot{width:7px;height:7px;border-radius:50%;background:#34d399;"
+        "animation:blink 1.4s ease-in-out infinite;}"
         "@keyframes blink{0%,100%{opacity:1}50%{opacity:0.3}}"
         "h1{font-size:28px;font-weight:800;color:#fff;letter-spacing:-0.5px;margin-bottom:8px;}"
-        ".username{"
-        "font-family:'DM Mono',monospace;"
-        "font-size:15px;color:#7c3aed;"
-        "background:rgba(124,58,237,0.1);"
-        "border:1px solid rgba(124,58,237,0.25);"
-        "padding:8px 20px;border-radius:8px;"
-        "display:inline-block;margin:16px 0 24px;"
-        "letter-spacing:0.02em;"
-        "}"
+        ".username{font-family:'DM Mono',monospace;font-size:15px;color:#7c3aed;"
+        "background:rgba(124,58,237,0.1);border:1px solid rgba(124,58,237,0.25);"
+        "padding:8px 20px;border-radius:8px;display:inline-block;margin:16px 0 24px;"
+        "letter-spacing:0.02em;}"
         ".desc{font-size:14px;color:rgba(255,255,255,0.45);line-height:1.7;margin-bottom:32px;}"
-        ".btn{"
-        "display:inline-flex;align-items:center;gap:10px;"
-        "background:linear-gradient(135deg,#7c3aed,#6d28d9);"
-        "color:#fff;text-decoration:none;"
+        ".btn{display:inline-flex;align-items:center;gap:10px;"
+        "background:linear-gradient(135deg,#7c3aed,#6d28d9);color:#fff;text-decoration:none;"
         "font-family:'Syne',sans-serif;font-weight:700;font-size:14px;"
-        "padding:14px 28px;border-radius:12px;"
-        "letter-spacing:0.03em;"
-        "transition:transform 0.2s,box-shadow 0.2s;"
-        "box-shadow:0 4px 20px rgba(124,58,237,0.4);"
-        "}"
+        "padding:14px 28px;border-radius:12px;letter-spacing:0.03em;"
+        "transition:transform 0.2s,box-shadow 0.2s;box-shadow:0 4px 20px rgba(124,58,237,0.4);}"
         ".btn:hover{transform:translateY(-2px);box-shadow:0 8px 28px rgba(124,58,237,0.55);}"
         ".divider{height:1px;background:rgba(255,255,255,0.06);margin:32px 0;}"
-        ".meta{font-family:'DM Mono',monospace;font-size:11px;color:rgba(255,255,255,0.2);letter-spacing:0.04em;}"
+        ".meta{font-family:'DM Mono',monospace;font-size:11px;color:rgba(255,255,255,0.2);"
+        "letter-spacing:0.04em;}"
         "</style>"
         "</head>"
         "<body>"
@@ -589,16 +555,66 @@ async def index():
         "<div class='card'>"
         "<div class='pulse-ring'>🎵</div>"
         "<div class='status-badge'><span class='dot'></span>ONLINE &amp; RUNNING</div>"
-        f"<h1>Music Download Bot</h1>"
-        f"<div class='username'>@{username}</div>"
+        "<h1>Music Download Bot</h1>"
+        f"<div class='username'>@{BOT_USERNAME}</div>"
         "<p class='desc'>Inline music bot powered by JioSaavn.<br/>Search any song in any Telegram chat.</p>"
-        f"<a class='btn' href='https://t.me/{username}'>Open in Telegram ↗</a>"
+        f"<a class='btn' href='https://t.me/{BOT_USERNAME}'>Open in Telegram ↗</a>"
         "<div class='divider'></div>"
         "<p class='meta'>TELETHON · FASTAPI · VERCEL</p>"
         "</div>"
         "</body></html>"
     )
     return HTMLResponse(content=html_content)
+
+
+@app.post("/webhook")
+async def webhook(request: Request):
+    try:
+        update = await request.json()
+    except Exception as e:
+        logger.error(f"[WEBHOOK] Failed to parse JSON: {e}")
+        return Response(status_code=400)
+
+    logger.info(f"[WEBHOOK] Update keys: {list(update.keys())}")
+
+    if "inline_query" in update:
+        asyncio.create_task(handle_inline_query(update))
+
+    elif "chosen_inline_result" in update:
+        asyncio.create_task(handle_chosen_inline_result(update))
+
+    elif "message" in update:
+        asyncio.create_task(handle_message(update))
+
+    return Response(status_code=200)
+
+
+@app.get("/set_webhook")
+async def set_webhook(request: Request):
+    host = request.headers.get("host", "")
+    webhook_url = f"https://{host}/webhook"
+    logger.info(f"[SETUP] Setting webhook to: {webhook_url}")
+    async with aiohttp.ClientSession() as session:
+        result = await tg_api(session, "setWebhook", {
+            "url": webhook_url,
+            "allowed_updates": ["message", "inline_query", "chosen_inline_result"],
+            "drop_pending_updates": True,
+        })
+    return JSONResponse(content=result)
+
+
+@app.get("/webhook_info")
+async def webhook_info():
+    async with aiohttp.ClientSession() as session:
+        result = await tg_api(session, "getWebhookInfo", {})
+    return JSONResponse(content=result)
+
+
+@app.get("/delete_webhook")
+async def delete_webhook():
+    async with aiohttp.ClientSession() as session:
+        result = await tg_api(session, "deleteWebhook", {"drop_pending_updates": True})
+    return JSONResponse(content=result)
 
 
 if __name__ == "__main__":
